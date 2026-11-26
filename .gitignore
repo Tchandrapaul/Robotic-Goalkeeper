@@ -3,3 +3,9 @@ __pycache__/
 *.pyc
 .DS_Store
 snapshot_index*.jpg
+
+# Local experimental calibration and diagnostic captures
+snapshots/
+config/live_settings.json
+config/floor_calibration*.json
+config/floor_calibration*.tmp

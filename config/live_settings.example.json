@@ -1,0 +1,18 @@
+{
+  "ball_diameter_m": 0.1524,
+  "camera_center_m": [
+    0.0,
+    0.0,
+    0.762
+  ],
+  "goal_width_m": 0.9144,
+  "goal_height_m": 0.6096,
+  "pivot_height_m": 0.0635,
+  "paddle_length_m": 0.635,
+  "paddle_width_m": 0.1016,
+  "paddle_below_pivot_m": 0.1143,
+  "angle_min_deg": 10.0,
+  "angle_max_deg": 170.0,
+  "preview_speed_deg_s": 180.0,
+  "geometry_note": "Example dimensions only: edit for your setup. The 4.5-inch shaft offset is provisional. Floor clearance, airborne accuracy, and motor timing are not validated. Preview only; no GPIO."
+}

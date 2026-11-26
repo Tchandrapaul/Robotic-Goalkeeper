@@ -56,3 +56,95 @@ If detection is jittery or picks up the wrong thing:
 
 Steps 2-4 depend on the physical goal setup and actuator hardware, so we'll
 tackle those once that's in place.
+
+## Experimental camera-to-paddle preview
+
+This branch adds `src/live_goalie.py` alongside the original tracker. It uses
+color-seeded ball outlines, short optical-flow/prediction bridges, approximate
+single-camera 3D estimation, and a simulated paddle. It does not command a motor
+or implement GPIO homing. The roadmap above describes the original baseline;
+these additions are experimental implementations of calibration and prediction.
+
+### Setup and calibration
+
+Use the existing Python environment and requirements. Camera capture currently
+uses Linux V4L2. Install `v4l-utils` if `v4l2-ctl` is missing; the runner uses it
+to disable dynamic frame rate on each launch when the camera supports it.
+A requested 60 FPS is not a guarantee of delivered frame rate.
+
+```bash
+cp config/live_settings.example.json config/live_settings.json
+```
+
+Edit the local settings for your actual ball diameter, camera position, goal,
+and paddle dimensions (meters). The example uses a 6-inch ball and a centered
+camera 30 inches above the floor; its 4.5-inch paddle shaft offset is provisional.
+The preview speed is an assumption, not a measured motor limit.
+
+Calibrate color for your own ball and lighting with the existing color tool.
+Back up shared HSV settings before saving over them; `--config` below can select
+an alternative HSV JSON without changing the shared file.
+
+```bash
+python3 src/calibrate_floor.py
+```
+
+Keep the camera fixed. Place a measured 8-by-10.5-inch notebook flat on the floor,
+with the 8-inch edge across the goal and the near edge toward the camera.
+Exclude spirals from the detected rectangle. Press Enter to confirm; Space
+allows review and corner adjustment, and M allows manual selection.
+The first setup asks for the near-edge distance from the blocking line and the
+notebook center's sideways offset (zero if centered, image-right positive).
+These are physical measurements, not distances inferred from the guide box.
+On subsequent runs, use the same physical location or press E to change it.
+Recalibrate after moving or tilting the camera. The standalone tool uses camera 0; integrated calibration uses `--camera`.
+
+### Run and capture a problem
+
+```bash
+python3 src/live_goalie.py --config config/hsv_config.json
+```
+
+Select a tracking rectangle that includes the ball's floor path AND airborne
+path. `--camera`, `--settings`, and `--calibration` select alternative inputs;
+use `--help` for details. Floor calibration must match the camera and resolution.
+
+- Q: quit.
+- R: reselect tracking area and reset tracking history.
+- M: show/hide the color mask.
+- S: save one snapshot set: camera, overlay, mask, simulated paddle, and state JSON.
+
+Snapshots go into `snapshots/` and are ignored by Git. Capture both successful
+and failed tracking and describe what the ball was doing when sharing a set.
+These controls belong to `live_goalie.py`; the original tracker is separate.
+
+FOLLOW points the preview toward the estimated current ball location even when
+there is no predicted crossing. INTERCEPT uses a predicted goal-line crossing.
+HOLD indicates no usable command. Following does not prove a shot can be blocked.
+
+### Current limits
+
+Single-camera airborne depth depends on the detected ball size and measured
+geometry. Fast kicks, occlusion, similar-colored objects, and inaccurate outlines
+can still break tracking. Prediction bridges are deliberately brief; a drawn
+trajectory is not a new measurement. Floor mapping does not correct lens distortion.
+The simulation does not establish real motor travel time, switch behavior, floor
+clearance, or successful physical interception. Local calibration and snapshots
+are intentionally excluded from the branch.
+
+### Recalibrate and track in one launch
+
+```bash
+python3 src/live_goalie.py --config config/pink_ball.json --calibrate
+```
+
+`--calibrate` opens notebook calibration first, then starts tracking after a
+successful save. Omit it to reuse saved calibration. Q cancels calibration and
+exits without starting tracking with an old mapping. `--camera` and
+`--calibration` apply to both calibration and tracking.
+
+Keep the notebook in its previously measured floor location or press E to edit
+its placement. Moving/tilting the camera requires a new calibration. If its
+height or position relative to the blocking line changes, also update
+`camera_center_m` in your local geometry settings; notebook calibration does not
+measure camera height automatically. Existing calibration is backed up on save.
