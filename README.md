@@ -37,6 +37,26 @@ If detection is jittery or picks up the wrong thing:
 - Use a ball color that contrasts strongly with the floor/background — this
   matters more than any code tweak.
 
+
+### Running and capturing snapshots
+
+Run from the repository root:
+python3 src/ball_tracker.py
+
+- Press S with an OpenCV window focused to toggle automatic snapshots.
+- While enabled, snapshots save approximately every 0.5 seconds.
+- Each timestamped folder under snapshots/ contains:
+  - camera.png: original frame
+  - overlay.png: tracking annotations and diagnostics
+  - mask.png: HSV detection mask
+- Press S again to stop saving.
+- Press Q to quit.
+
+Keep snapshots off when measuring FPS; saving images can slow capture.
+
+The tracker currently loads config/pink_ball.json. Select the appropriate calibration before testing a different ball.
+
+
 ## Roadmap (what's next)
 
 1. **Color-based detection** (done above) — fast, simple, good enough if the
