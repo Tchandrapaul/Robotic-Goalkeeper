@@ -246,10 +246,6 @@ def main():
                 print(f"Dropping out-of-range angle {angle} from {addr}")
                 continue
 
-            # Keep initial physical tests near center without limit switches.
-            if not args.dry_run and not 85.0 <= angle <= 95.0:
-                print(f"Dropping angle {angle:g}: physical test range is 85-95 degrees")
-                continue
 
             last_seq = seq
             print(f"seq={seq} angle={angle:.1f} age={age * 1000:.0f}ms from {addr}")
