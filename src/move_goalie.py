@@ -2,18 +2,32 @@ import argparse
 import math
 import re #to identify correct GPIO chip by line name
 import time
+import socket
 
-PULSE_GPIO = 18 # Pi pin 12/ On Driver PU+ 
-DIR_GPIO = 23 # Pi pin 16/ On Driver DR+
+PULSE_GPIO = 18 #Pi pin 12/ On Driver PU+ 
+DIR_GPIO = 23 #Pi pin 16/ On Driver DR+
+LEFT_LIMIT_GPIO = 17 #pi pin 11
+RIGHT_LIMIT_GPIO = 24 #home switch pi pin 18
+
 PULSES_PER_REV = 1600 # adjusted by switches on stepper driver
 
 center_position = 90.0 #paddle set at 90 degrees
 min_position = 0.0
 max_position = 180.0
 START_HZ = 180.0 #pulses per second, (HZ x 60)/PULSES_PER_REV, 6.75RPM
+HOME_HZ = 180.0 #6.75 rpm
 ACCEL_HZ_PER_SEC = 12000.0 #acceleration of pulse frequency per second
 PULSES_PER_BATCH = 12 #sends 12 pulses at current frequency
 max_rpm = 150.0
+
+HOST = "0.0.0.0"
+PORT = 5000
+
+def start_server():
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind((HOST, PORT))
+    server.listen(1)
+    return server
 
 #takes an angle and calculates the number of pulses to get to that angle
 #a negative will make it turn towards 0 degrees
@@ -85,7 +99,7 @@ class Goalie:
         self.current_steps = 0 #number of steps away from 90 degrees
         self.handle = None #refrence for GPIO controller
         self.lgpio = None
-        self.position_known = True
+        self.position_known = False
 
         if not dry_run:
             import lgpio
@@ -94,18 +108,53 @@ class Goalie:
             try: #configure pins as output pins, set initially to low (0)
                 lgpio.gpio_claim_output(self.handle, PULSE_GPIO, 0)
                 lgpio.gpio_claim_output(self.handle, DIR_GPIO, 0)
+                lgpio.gpio_claim_input(self.handle, LEFT_LIMIT_GPIO, lgpio.SET_PULL_UP)
+                lgpio.gpio_claim_input(self.handle, RIGHT_LIMIT_GPIO, lgpio.SET_PULL_UP)
             except BaseException:
                 lgpio.gpiochip_close(self.handle)
                 raise
             print(f'using GPIO chip: {chip_number}; BCM pins: 18(pulse) and 23(direction)')
 
-    #def home(self): #homing using limit switches  
-        #move slowly toward the 0-degree limit switch
-        #stop when switch is activated, now we know the position of paddle is 0 degree
-        #set current_steps = -(PULSES_PER_REV/4) (ex:1600/4, currently its -400 steps away from 90 deg)
-        #move abs(PULSES_PER_REV/4) (0 -> 90)
-        #set current_steps = 0
-        #set position_known = True
+    def left_limit_pressed(self):
+        return self.lgpio.gpio_read(self.handle, LEFT_LIMIT_GPIO) == 1
+
+    def right_limit_pressed(self):
+        return self.lgpio.gpio_read(self.handle, RIGHT_LIMIT_GPIO) == 1
+
+    def home(self): #homing using limit switches
+        print("homing started...")
+        self.position_known = False
+
+        if self.dry_run:
+            self.current_steps = 0
+            self.position_known = True
+            return
+
+        #set motor towards 180 degree direction
+        self.lgpio.gpio_write(self.handle, DIR_GPIO, 0)
+        time.sleep(0.003)
+
+        pulses = 0
+        max_pulses = PULSES_PER_REV // 2
+
+        while not self.right_limit_pressed():
+            if pulses >= max_pulses:
+                self.stop()
+                raise RuntimeError("Homing switch not reached")
+            
+            self.lgpio.gpio_write(self.handle, PULSE_GPIO, 1) #set pulse to high
+            time.sleep(0.5/HOME_HZ) # (0.5/180) = ~2.78ms
+            self.lgpio.gpio_write(self.handle, PULSE_GPIO, 0) #set pulse to low
+            time.sleep(0.5/HOME_HZ)
+
+            pulses = pulses + 1
+        
+        self.stop()
+        self.current_steps = target_steps(180.0)
+        self.position_known = True
+        self.move_to(90.0)
+        print("homing complete")
+        
 
 
     def stop(self): #stop motor pulses
@@ -203,19 +252,24 @@ def main():
     if not math.isfinite(args.max_rpm) or not 10 <= args.max_rpm <= max_rpm:
         parser.error('Choose --max-rpm between 10 and 150 for initial testing.')
     print('GOALIE | 0-180 degrees | center = 90 degrees')
-    print('WARNING: NO HOMING SENSOR, NO PHYSICAL LIMIT MONITORING, NO PI ENCODER FEEDBACK.')
-    print('Use a physical emergency cutoff; STOP if the paddle binds or driver alarms.')
-    if not args.dry_run:
-        prompt = input('Power OFF to align the paddle physically at 90deg, '
-                       'then power ON. Type CENTERED to arm: ').strip()
-        if prompt != 'CENTERED':
-            print('Not armed. Exiting without motor movement.')
-            return
     motor = Goalie(args.max_rpm, args.chip, args.dry_run)
     try:
-        print(f'RPM ceiling: {args.max_rpm:g}. First test 85 or 95 degrees only.')
+        motor.home()
+
+        server = start_server()
+        print("waiting for laptop connection...")
+        connection, address =  server.accept()
+        print(f"connected to {address}")
+        stream = connection.makefile("r")
+
         while True:
-            response = input('\nTarget angle 0-180 (q to quit): ').strip().lower()
+            #response = input('\nTarget angle 0-180 (q to quit): ').strip().lower()
+            response = stream.readline()
+            if not response:
+                print("laptop disconnected")
+                break
+            response = response.strip() #response must include \n at end of every angle
+
             if response in ('q', 'quit', 'exit'):
                 break
             try:
@@ -227,13 +281,19 @@ def main():
                 print('Enter an angle or q.')
                 continue
             motor.move_to(angle)
-            input('Press Enter AFTER the shot to return to center (90deg)... ')
+            time.sleep(5) #hold angle for 5 seconds then move back to 90
             motor.move_to(90.0)
     except (KeyboardInterrupt, EOFError):
         print('\nInterrupted. Re-establish center before restarting.')
     finally:
         motor.close()
-        print('Pulse output stopped. Driver may still hold motor torque.')
+        if 'stream' in locals():
+            stream.close()
+        if 'connection' in locals():
+            connection.close()
+        if 'server' in locals():
+            server.close()
+        print("motor stopped and network connection closed")
 
 
 if __name__ == '__main__':
