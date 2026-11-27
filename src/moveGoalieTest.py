@@ -120,10 +120,12 @@ class Goalie:
             try:
                 #(handle, gpio, pusle frequency, duty cycle)
                 self.lgpio.tx_pwm(self.handle, PULSE_GPIO, 0, 0) #cancels pulse generation
-                #(handle, gpio, voltage)
-                self.lgpio.gpio_write(self.handle, PULSE_GPIO, 0) #keep pulse line on low (0) when stopped
             except Exception as err:
                 print(f'WARNING: PWM cancellation failed: {err}')
+            try:
+                self.lgpio.gpio_write(self.handle, PULSE_GPIO, 0)
+            except Exception as err:
+                print(f'WARNING: Could not set pulse output low: {err}')
 
     def close(self): #close GPIO resources when program exits
         if self.handle is not None:
@@ -189,20 +191,29 @@ class Goalie:
             raise
 
 def main():
-    parser = argparse.ArgumentParser(description='Goalie UDP connection test (no physical motor movement)')
+    parser = argparse.ArgumentParser(description='Goalie UDP motor test (manual centering; no limit switches)')
     parser.add_argument('--port', type=int, default=PORT)
-    parser.add_argument('--max-rpm', type=float, default=60,
-                        help='Initial speed ceiling (default 60 RPM; maximum 150).')
+    parser.add_argument('--max-rpm', type=float, default=10,
+                        help='Initial speed ceiling (default 10 RPM; maximum 150).')
     parser.add_argument('--chip', type=int, default=None,
                         help='GPIO chip number; autodetect if omitted.')
     parser.add_argument('--dry-run', action='store_true',
-                        help='Compatibility flag; this test version always runs without GPIO.')
+                        help='Receive and simulate angles without opening GPIO or moving the motor.')
     args = parser.parse_args()
     if not math.isfinite(args.max_rpm) or not 10 <= args.max_rpm <= max_rpm:
         parser.error('Choose --max-rpm between 10 and 150 for initial testing.')
     print('GOALIE | 0-180 degrees | center = 90 degrees')
-    print("Connection test only: GPIO disabled; no physical motor movement.")
-    motor = Goalie(args.max_rpm, args.chip, dry_run=True)
+    if args.dry_run:
+        print("Dry run: GPIO disabled; no physical motor movement.")
+    else:
+        print("WARNING: No homing or physical limit switches. Keep an emergency power cutoff accessible.")
+        print("With motor power OFF, manually center the paddle at 90 degrees.")
+        print("Clear the paddle's travel area, then power ON the motor.")
+        if input("Type CENTERED to arm: ").strip() != "CENTERED":
+            print("Not armed. Exiting.")
+            return
+    motor = Goalie(args.max_rpm, args.chip, dry_run=args.dry_run)
+    motor.position_known = True  # Manual centering confirmed, or simulated center.
     try:
 
         server = start_server(args.port)
@@ -235,12 +246,17 @@ def main():
                 print(f"Dropping out-of-range angle {angle} from {addr}")
                 continue
 
+            # Keep initial physical tests near center without limit switches.
+            if not args.dry_run and not 85.0 <= angle <= 95.0:
+                print(f"Dropping angle {angle:g}: physical test range is 85-95 degrees")
+                continue
+
             last_seq = seq
             print(f"seq={seq} angle={angle:.1f} age={age * 1000:.0f}ms from {addr}")
-            # Simulate the target immediately; do not block incoming packets.
+            # Move to the received target (or simulate in dry-run mode).
             motor.move_to(angle)
     except (KeyboardInterrupt, EOFError):
-        print('\nInterrupted. Connection test ended.')
+        print('\nInterrupted. Recenter manually before restarting.')
     finally:
         motor.close()
         if 'server' in locals():
