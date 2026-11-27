@@ -2,18 +2,38 @@ import argparse
 import math
 import re #to identify correct GPIO chip by line name
 import time
+import socket
+import json
 
-PULSE_GPIO = 18 # Pi pin 12/ On Driver PU+ 
-DIR_GPIO = 23 # Pi pin 16/ On Driver DR+
+PULSE_GPIO = 18 #Pi pin 12/ On Driver PU+ 
+DIR_GPIO = 23 #Pi pin 16/ On Driver DR+
+LEFT_LIMIT_GPIO = 17 #pi pin 11
+RIGHT_LIMIT_GPIO = 24 #home switch pi pin 18
+
 PULSES_PER_REV = 1600 # adjusted by switches on stepper driver
 
 center_position = 90.0 #paddle set at 90 degrees
 min_position = 0.0
 max_position = 180.0
 START_HZ = 180.0 #pulses per second, (HZ x 60)/PULSES_PER_REV, 6.75RPM
+HOME_HZ = 180.0 #6.75 rpm
 ACCEL_HZ_PER_SEC = 12000.0 #acceleration of pulse frequency per second
 PULSES_PER_BATCH = 12 #sends 12 pulses at current frequency
+LIMIT_BACKOFF_PULSES = 40 #maximum slow pulses to release/re-find a switch
 max_rpm = 150.0
+
+HOST = "0.0.0.0"
+PORT = 5005
+MAX_PACKET_AGE_S = 0.5
+
+def start_server(port=PORT):
+    server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        server.bind((HOST, port))
+    except BaseException:
+        server.close()
+        raise
+    return server
 
 #takes an angle and calculates the number of pulses to get to that angle
 #a negative will make it turn towards 0 degrees
@@ -85,7 +105,7 @@ class Goalie:
         self.current_steps = 0 #number of steps away from 90 degrees
         self.handle = None #refrence for GPIO controller
         self.lgpio = None
-        self.position_known = True
+        self.position_known = False
 
         if not dry_run:
             import lgpio
@@ -94,18 +114,109 @@ class Goalie:
             try: #configure pins as output pins, set initially to low (0)
                 lgpio.gpio_claim_output(self.handle, PULSE_GPIO, 0)
                 lgpio.gpio_claim_output(self.handle, DIR_GPIO, 0)
+                lgpio.gpio_claim_input(self.handle, LEFT_LIMIT_GPIO, lgpio.SET_PULL_UP)
+                lgpio.gpio_claim_input(self.handle, RIGHT_LIMIT_GPIO, lgpio.SET_PULL_UP)
             except BaseException:
                 lgpio.gpiochip_close(self.handle)
                 raise
             print(f'using GPIO chip: {chip_number}; BCM pins: 18(pulse) and 23(direction)')
 
-    #def home(self): #homing using limit switches  
-        #move slowly toward the 0-degree limit switch
-        #stop when switch is activated, now we know the position of paddle is 0 degree
-        #set current_steps = -(PULSES_PER_REV/4) (ex:1600/4, currently its -400 steps away from 90 deg)
-        #move abs(PULSES_PER_REV/4) (0 -> 90)
-        #set current_steps = 0
-        #set position_known = True
+    def left_limit_pressed(self):
+        return self.lgpio.gpio_read(self.handle, LEFT_LIMIT_GPIO) == 1
+
+    def right_limit_pressed(self):
+        return self.lgpio.gpio_read(self.handle, RIGHT_LIMIT_GPIO) == 1
+
+    def limit_reached(self, direction):
+        if direction == 0:
+            return self.right_limit_pressed()
+        else:
+            return self.left_limit_pressed()
+
+    def slow_pulse(self):
+        # One pulse at homing speed, with the output left LOW.
+        self.lgpio.gpio_write(self.handle, PULSE_GPIO, 1)
+        try:
+            time.sleep(0.5 / HOME_HZ)
+        finally:
+            self.lgpio.gpio_write(self.handle, PULSE_GPIO, 0)
+        time.sleep(0.5 / HOME_HZ)
+
+    def handle_limit(self, direction):
+        self.position_known = False
+        self.stop()
+
+        # Do not reverse until the current batch has finished.
+        deadline = time.monotonic() + 1.0
+        while self.lgpio.tx_busy(self.handle, PULSE_GPIO, 0):
+            if time.monotonic() > deadline:
+                raise RuntimeError("Motor pulses did not stop")
+            time.sleep(0.001)
+        self.lgpio.gpio_write(self.handle, PULSE_GPIO, 0)
+
+        # A batch may have continued after the switch was first pressed.
+        # Back away until it releases, then slowly find its activation point.
+        away = 1 - direction
+        self.lgpio.gpio_write(self.handle, DIR_GPIO, away)
+        time.sleep(0.003)
+        for _ in range(LIMIT_BACKOFF_PULSES):
+            if not self.limit_reached(direction):
+                break
+            if self.limit_reached(away):
+                raise RuntimeError("Opposite limit pressed during recovery")
+            self.slow_pulse()
+        if self.limit_reached(direction):
+            raise RuntimeError("Limit switch did not release")
+
+        self.lgpio.gpio_write(self.handle, DIR_GPIO, direction)
+        time.sleep(0.003)
+        for _ in range(LIMIT_BACKOFF_PULSES):
+            if self.limit_reached(direction):
+                break
+            self.slow_pulse()
+        if not self.limit_reached(direction):
+            raise RuntimeError("Limit switch not found again")
+
+        self.current_steps = target_steps(180.0 if direction == 0 else 0.0)
+        self.position_known = True
+        print("Limit reached, returning to center")
+        # Disable nested recovery: an unexpected limit on the way back is a fault.
+        self.move_to(center_position, recover_limit=False)
+        if self.left_limit_pressed() or self.right_limit_pressed():
+            self.position_known = False
+            raise RuntimeError("Limit switch still active at center")
+
+    def home(self): #homing using limit switches
+        print("homing started...")
+        self.position_known = False
+
+        if self.dry_run:
+            self.current_steps = 0
+            self.position_known = True
+            return
+
+        if self.left_limit_pressed() and self.right_limit_pressed():
+            raise RuntimeError("Both limit switches active")
+
+        #set motor towards 180 degree direction
+        self.lgpio.gpio_write(self.handle, DIR_GPIO, 0)
+        time.sleep(0.003)
+
+        pulses = 0
+        max_pulses = PULSES_PER_REV // 2
+
+        while not self.right_limit_pressed():
+            if pulses >= max_pulses:
+                self.stop()
+                raise RuntimeError("Homing switch not reached")
+            
+            self.slow_pulse()
+
+            pulses = pulses + 1
+        
+        self.handle_limit(0)
+        print("homing complete")
+        
 
 
     def stop(self): #stop motor pulses
@@ -124,7 +235,7 @@ class Goalie:
             self.lgpio.gpiochip_close(self.handle)
             self.handle = None
 
-    def move_to(self,angle): #move to predicted angle
+    def move_to(self, angle, recover_limit=True): #move to predicted angle
         if not math.isfinite(angle) or not min_position <= angle <= max_position:
             raise ValueError('Angle must be a number from 0 to 180 degrees')
         
@@ -138,7 +249,7 @@ class Goalie:
 
         if not total: #if total is 0, paddle is at requested position
             print(f'already at commanded {angle:g} degrees')
-            return
+            return True
 
         #set direction
         if delta > 0: #move toward 180 (clockwise)
@@ -158,41 +269,52 @@ class Goalie:
         if self.dry_run: #simulate
             self.current_steps = wanted_steps
             print('dry run: no gpio signals generated')
-            return
+            return True
         
         try: #to protect movement so a failure invalidates position tracking
             self.lgpio.gpio_write(self.handle, DIR_GPIO, direction) #set direction
             time.sleep(0.003)
 
-            queue_deadline = time.monotonic() + max(2.0, expected_time * 4 + 1)
-            #schedule each pulse batch and its target frequency
+            # Send one batch at a time and monitor its direction's limit.
             for num_of_pulses, frequency in batches:
-                #while the queue is full, 0: check the PWM transmission queue
-                while self.lgpio.tx_room(self.handle, PULSE_GPIO, 0) < 1:
-                    if time.monotonic() > queue_deadline:
-                        raise TimeoutError('PWM queue did not drain on time')
+                if self.limit_reached(direction):
+                    if not recover_limit:
+                        raise RuntimeError("Unexpected limit during return to center")
+                    self.handle_limit(direction)
+                    return False
+
+                self.lgpio.tx_pwm(self.handle, PULSE_GPIO, frequency, 50.0, 0, num_of_pulses)
+                deadline = time.monotonic() + max(1.0, num_of_pulses / frequency * 4)
+
+                while self.lgpio.tx_busy(self.handle, PULSE_GPIO, 0):
+                    if self.limit_reached(direction):
+                        if not recover_limit:
+                            raise RuntimeError("Unexpected limit during return to center")
+                        self.handle_limit(direction)
+                        return False
+                    if time.monotonic() > deadline:
+                        raise TimeoutError("PWM batch did not finish on time")
                     time.sleep(0.001)
 
-                #generate pulses from current batch
-                #(reference to gpio controller, gpio pin, frequency, duty cycle, pulse offset(delay), batch size)
-                self.lgpio.tx_pwm(self.handle, PULSE_GPIO, frequency, 50.0, 0, num_of_pulses)
-            
-            done_deadline = time.monotonic() + max(1.0, expected_time * 3 + 0.5) #time limit for full queue execution
-            while self.lgpio.tx_busy(self.handle, PULSE_GPIO, 0): #while PWM pulses are being transmitted
-                if time.monotonic() > done_deadline:
-                    raise TimeoutError('PWM did not finish on time')
-                time.sleep(0.001)
-            
+                # Also check after the batch, including the final batch.
+                if self.limit_reached(direction):
+                    if not recover_limit:
+                        raise RuntimeError("Unexpected limit during return to center")
+                    self.handle_limit(direction)
+                    return False
+
             #update current position
             self.current_steps = wanted_steps
             print(f'command complete; assumed position: {angle:g} degrees')
+            return True
         except BaseException:
             self.position_known = False
             self.stop()
             raise
 
 def main():
-    parser = argparse.ArgumentParser(description='Guarded fast goalie paddle test')
+    parser = argparse.ArgumentParser(description='Goalie UDP angle receiver and motor controller')
+    parser.add_argument('--port', type=int, default=PORT)
     parser.add_argument('--max-rpm', type=float, default=60,
                         help='Initial speed ceiling (default 60 RPM; maximum 150).')
     parser.add_argument('--chip', type=int, default=None,
@@ -203,37 +325,53 @@ def main():
     if not math.isfinite(args.max_rpm) or not 10 <= args.max_rpm <= max_rpm:
         parser.error('Choose --max-rpm between 10 and 150 for initial testing.')
     print('GOALIE | 0-180 degrees | center = 90 degrees')
-    print('WARNING: NO HOMING SENSOR, NO PHYSICAL LIMIT MONITORING, NO PI ENCODER FEEDBACK.')
-    print('Use a physical emergency cutoff; STOP if the paddle binds or driver alarms.')
-    if not args.dry_run:
-        prompt = input('Power OFF to align the paddle physically at 90deg, '
-                       'then power ON. Type CENTERED to arm: ').strip()
-        if prompt != 'CENTERED':
-            print('Not armed. Exiting without motor movement.')
-            return
     motor = Goalie(args.max_rpm, args.chip, args.dry_run)
     try:
-        print(f'RPM ceiling: {args.max_rpm:g}. First test 85 or 95 degrees only.')
+        motor.home()
+
+        server = start_server(args.port)
+        print(f"Listening for UDP angle commands on port {args.port}...")
+        last_seq = -1
+
         while True:
-            response = input('\nTarget angle 0-180 (q to quit): ').strip().lower()
-            if response in ('q', 'quit', 'exit'):
-                break
+            data, addr = server.recvfrom(1024)
             try:
-                angle = float(response)
-                if not math.isfinite(angle) or not 0 <= angle <= 180:
-                    print('Enter an angle between 0 and 180.')
-                    continue
-            except ValueError:
-                print('Enter an angle or q.')
+                msg = json.loads(data.decode())
+                seq = int(msg["seq"])
+                sent_at = float(msg["ts"])
+                angle = float(msg["angle"])
+            except (KeyError, ValueError, TypeError, OverflowError):
+                print(f"Dropping malformed packet from {addr}")
                 continue
-            motor.move_to(angle)
-            input('Press Enter AFTER the shot to return to center (90deg)... ')
-            motor.move_to(90.0)
+
+            if seq <= last_seq:
+                print(f"Dropping out-of-order packet (seq={seq}, last={last_seq})")
+                continue
+            if not math.isfinite(sent_at) or not math.isfinite(angle):
+                print(f"Dropping non-finite packet from {addr}")
+                continue
+
+            age = time.time() - sent_at
+            if age > MAX_PACKET_AGE_S or age < -MAX_PACKET_AGE_S:
+                print(f"Dropping packet (seq={seq}, age={age:.3f}s; stale or clock mismatch)")
+                continue
+            if not min_position <= angle <= max_position:
+                print(f"Dropping out-of-range angle {angle} from {addr}")
+                continue
+
+            last_seq = seq
+            print(f"seq={seq} angle={angle:.1f} age={age * 1000:.0f}ms from {addr}")
+            if motor.move_to(angle):
+                time.sleep(5) # hold angle for 5 seconds then return to center
+                motor.move_to(90.0)
+            # False means a limit was reached and the paddle already returned to center.
     except (KeyboardInterrupt, EOFError):
         print('\nInterrupted. Re-establish center before restarting.')
     finally:
         motor.close()
-        print('Pulse output stopped. Driver may still hold motor torque.')
+        if 'server' in locals():
+            server.close()
+        print("motor stopped and network connection closed")
 
 
 if __name__ == '__main__':
